@@ -1,4 +1,4 @@
-// Copyright 2020 the Pinniped contributors. All Rights Reserved.
+// Copyright 2020-2021 the Pinniped contributors. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
 package manager
@@ -112,6 +112,7 @@ func (m *Manager) SetProviders(federationDomains ...*provider.FederationDomainIs
 			issuer,
 			m.idpListGetter,
 			oauthHelperWithNullStorage,
+			oauthHelperWithKubeStorage,
 			csrftoken.Generate,
 			pkce.Generate,
 			nonce.Generate,

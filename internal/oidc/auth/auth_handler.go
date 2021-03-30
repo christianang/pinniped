@@ -1,4 +1,4 @@
-// Copyright 2020 the Pinniped contributors. All Rights Reserved.
+// Copyright 2020-2021 the Pinniped contributors. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
 // Package auth provides a handler for the OIDC authorization endpoint.
@@ -28,7 +28,8 @@ import (
 func NewHandler(
 	downstreamIssuer string,
 	idpListGetter oidc.IDPListGetter,
-	oauthHelper fosite.OAuth2Provider,
+	oauthHelperWithNullStorage fosite.OAuth2Provider,
+	oauthHelperWithRealStorage fosite.OAuth2Provider,
 	generateCSRF func() (csrftoken.CSRFToken, error),
 	generatePKCE func() (pkce.Code, error),
 	generateNonce func() (nonce.Nonce, error),
@@ -45,18 +46,20 @@ func NewHandler(
 
 		csrfFromCookie := readCSRFCookie(r, cookieCodec)
 
-		authorizeRequester, err := oauthHelper.NewAuthorizeRequest(r.Context(), r)
+		authorizeRequester, err := oauthHelperWithNullStorage.NewAuthorizeRequest(r.Context(), r)
 		if err != nil {
 			plog.Info("authorize request error", oidc.FositeErrorForLog(err)...)
-			oauthHelper.WriteAuthorizeError(w, authorizeRequester, err)
+			oauthHelperWithNullStorage.WriteAuthorizeError(w, authorizeRequester, err)
 			return nil
 		}
 
-		upstreamIDP, err := chooseUpstreamIDP(idpListGetter)
-		if err != nil {
-			plog.WarningErr("authorize upstream config", err)
-			return err
-		}
+		var upstreamIDP provider.UpstreamOIDCIdentityProviderI
+		// TODO this would need to look up the IDP and either return an OIDC or LDAP IDP
+		//upstreamIDP, err := chooseUpstreamIDP(idpListGetter)
+		//if err != nil {
+		//	plog.WarningErr("authorize upstream config", err)
+		//	return err
+		//}
 
 		// Grant the openid scope (for now) if they asked for it so that `NewAuthorizeResponse` will perform its OIDC validations.
 		oidc.GrantScopeIfRequested(authorizeRequester, coreosoidc.ScopeOpenID)
@@ -67,8 +70,57 @@ func NewHandler(
 		// Grant the pinniped:request-audience scope if requested.
 		oidc.GrantScopeIfRequested(authorizeRequester, "pinniped:request-audience")
 
+		// TODO We would check here if the upstreamIDP variable is of type LDAP.
+		//  For our spike, we will just force ourselves into the LDAP IDP branch.
+		if true { // if this was a request to log in to an LDAP IDP...
+			// "authenticate" basic auth creds by checking that they match username/password
+			username, password, basicAuthExists := r.BasicAuth()
+			if !basicAuthExists {
+				// in the future, if we wanted to, this could redirect to a web-based login page. for now,
+				// we will simply return an error and therefore require basic auth for all LDAP IDP logins.
+				//
+				// TODO for a real implementation, according to the OIDC spec 3.1.2.6 (second paragraph), we should
+				//  be returning this error via a redirect to the client's redirect uri. we can get fosite's
+				//  help here.
+				return httperr.New(http.StatusUnauthorized, "expected basic auth")
+			}
+
+			// if they don't match, then return some failure as the authorize response
+			if !(username == "fake-username" && password == "password123") {
+				// TODO as above, for a real implementation, we will want to return an error according to OIDC spec
+				//  3.1.2.6 (second paragraph).
+				return httperr.New(http.StatusUnauthorized, "username/password does not match")
+			}
+
+			// make up fake downstream username and downstream groups and create downstream session (see callback_handler.go:94)
+			now := time.Now().UTC()
+			openIDSession := &openid.DefaultSession{
+				Claims: &jwt.IDTokenClaims{
+					Subject:     "some-ldap-subject", // TODO: pull this from actual LDAP IDP
+					RequestedAt: now,
+					AuthTime:    now,
+				},
+			}
+			openIDSession.Claims.Extra = map[string]interface{}{
+				oidc.DownstreamUsernameClaim: "some-ldap-username",                               // TODO: pull this from actual LDAP IDP
+				oidc.DownstreamGroupsClaim:   []string{"some-ldap-group-1", "some-ldap-group-2"}, // TODO: pull this from actual LDAP IDP
+			}
+
+			// create authorize response (see callback_handler.go:95)
+			authorizeResponder, err := oauthHelperWithRealStorage.NewAuthorizeResponse(r.Context(), authorizeRequester, openIDSession)
+			if err != nil {
+				plog.WarningErr("error while generating and saving authcode", err, "upstreamName", "ldap")
+				return httperr.Wrap(http.StatusInternalServerError, "error while generating and saving authcode", err)
+			}
+
+			// write authorize response (see callback_handler.go:101)
+			oauthHelperWithRealStorage.WriteAuthorizeResponse(w, authorizeRequester, authorizeResponder)
+
+			return nil
+		}
+
 		now := time.Now()
-		_, err = oauthHelper.NewAuthorizeResponse(r.Context(), authorizeRequester, &openid.DefaultSession{
+		_, err = oauthHelperWithNullStorage.NewAuthorizeResponse(r.Context(), authorizeRequester, &openid.DefaultSession{
 			Claims: &jwt.IDTokenClaims{
 				// Temporary claim values to allow `NewAuthorizeResponse` to perform other OIDC validations.
 				Subject:     "none",
@@ -78,7 +130,7 @@ func NewHandler(
 		})
 		if err != nil {
 			plog.Info("authorize response error", oidc.FositeErrorForLog(err)...)
-			oauthHelper.WriteAuthorizeError(w, authorizeRequester, err)
+			oauthHelperWithNullStorage.WriteAuthorizeError(w, authorizeRequester, err)
 			return nil
 		}
 

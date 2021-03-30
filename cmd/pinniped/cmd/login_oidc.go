@@ -22,6 +22,7 @@ import (
 	clientauthv1beta1 "k8s.io/client-go/pkg/apis/clientauthentication/v1beta1"
 	"k8s.io/klog/v2/klogr"
 
+	"go.pinniped.dev/internal/constable"
 	"go.pinniped.dev/internal/groupsuffix"
 	"go.pinniped.dev/pkg/conciergeclient"
 	"go.pinniped.dev/pkg/oidcclient"
@@ -148,20 +149,89 @@ func runOIDCLogin(cmd *cobra.Command, deps oidcLoginCommandDeps, flags oidcLogin
 		}
 	}
 
-	// --skip-browser replaces the default "browser open" function with one that prints to stderr.
-	if flags.skipBrowser {
-		opts = append(opts, oidcclient.WithBrowserOpen(func(url string) error {
-			cmd.PrintErr("Please log in: ", url, "\n")
-			return nil
-		}))
-	}
-
+	clientForLDAPAuthorization := &http.Client{} // need to get the CA bundle onto this client too
 	if len(flags.caBundlePaths) > 0 || len(flags.caBundleData) > 0 {
 		client, err := makeClient(flags.caBundlePaths, flags.caBundleData)
 		if err != nil {
 			return err
 		}
 		opts = append(opts, oidcclient.WithClient(client))
+		clientForLDAPAuthorization = client
+	}
+
+	// TODO: do IDP discovery (*waves hands* - we haven't figured out how we are going to do this yet)
+	// ldap spike code - if we have discovered that the user wants to login to an ldap IDP, make it so
+	// that instead of opening a browser, the CLI calls the authorization endpoint with creds and gets
+	// directed to the localhost callback.
+	if true { // if the IDP is an LDAP IDP...
+		opts = append(opts, oidcclient.WithBrowserOpen(func(url string) error {
+			// create http request with provided url
+			req, err := http.NewRequestWithContext(context.TODO(), http.MethodGet, url, nil)
+			if err != nil {
+				return fmt.Errorf("cannot create HTTP request from url %q: %w", url, err)
+			}
+
+			// TODO: prompt the user for the username and password; we could use the custom prompts from
+
+			// set basic auth header on http request
+			req.SetBasicAuth("fake-username", "password123")
+
+			// make http request. a couple of cases we could get into:
+			// - the authorize endpoint redirects us to the localhost callback, and the localhost callback succeeds
+			//   - in this case, we can return no error because everything is happy
+			// - the authorize endpoint redirects us to the localhost callback, and the localhost callback fails
+			//   - in this case, we can return no error because the localhost callback will report the error
+			//     to the main goroutine
+			// - the authorize endpoint returns anything other than a redirect (200's, 400's or 500's)
+			//   - in this case, we should handle the error because the localhost callback will not be called
+			redirected := false
+			clientForLDAPAuthorization.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+				// the standard go library does this check for us, but since we are writing our own redirect
+				// handler, we need to write it manually
+				if len(via) >= 10 {
+					return constable.Error("stopped after 10 redirects")
+				}
+
+				// TODO: check that the redirect is for our localhost listener, otherwise print an error (we
+				//  should only be redirected to our localhost listener because we provided the basic auth
+				//  header)
+
+				redirected = true
+				return nil
+			}
+
+			// Note that the WithBrowserOpen func needs to return immediately, before the request is made, because the
+			// localhost listener wants to handle the request by sending on a blocking channel that will only be read
+			// after this function has returned. This is fine for a spike but should be done more elegantly for a real
+			// implementation.
+			go func() {
+				cmd.PrintErr("Debug: making authorize request with basicauth credentials... ", url, "\n")
+				rsp, err := clientForLDAPAuthorization.Do(req)
+				if err != nil {
+					// TODO handle this error better
+					panic(fmt.Sprintf("cannot make HTTP request to url %q: %w", url, err))
+				}
+				defer rsp.Body.Close() // TODO: and drain body?
+				if !redirected {
+					// TODO in a real implementation, we should probably print different error messages depending on
+					//  what the response code is (e.g., we might want a very tailored error message for 401)
+					body, err := ioutil.ReadAll(rsp.Body)
+					if err != nil {
+						body = []byte("")
+					}
+					// TODO handle this error better
+					panic(fmt.Sprintf("we thought we were gonna get redirected, but we got: %s %s", rsp.Status, body))
+				}
+			}()
+
+			return nil
+		}))
+	} else if flags.skipBrowser {
+		// --skip-browser replaces the default "browser open" function with one that prints to stderr.
+		opts = append(opts, oidcclient.WithBrowserOpen(func(url string) error {
+			cmd.PrintErr("Please log in: ", url, "\n")
+			return nil
+		}))
 	}
 
 	// Do the basic login to get an OIDC token.
